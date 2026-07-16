@@ -22,12 +22,12 @@ import baritone.api.IBaritone;
 public class GrinderBotClient implements ClientModInitializer {
 
     // ---- Tunables ----
-    private static final int ATTACK_INTERVAL_TICKS = 1;   // 20 ticks/sec ÷ 10 cps
+    private static final int ATTACK_INTERVAL_TICKS = 2;   // 20 ticks/sec ÷ 10 cps
     private static final double ATTACK_RANGE = 3.0;        // blocks, 1.8-style reach
     private static final double SEARCH_RADIUS = 24.0;      // blocks, how far to look for mites
     private static final String GRIND_TOKEN_NAME = "Grind Token";
     private static final String GIFT_TARGET = "shivanshu7";
-    private static final int TOKEN_THRESHOLD = 15;
+    private static final int TOKEN_THRESHOLD = 5;
     private static final int GIFT_MENU_TOKEN_SLOT = 11;
 
     private static final int WAIT_GOTO_START_TIMEOUT = 40;
@@ -38,7 +38,7 @@ public class GrinderBotClient implements ClientModInitializer {
         IDLE,
         WAIT_FOR_GOTO_START, WAIT_FOR_ARRIVAL,
         ACTIVE,
-        SEND_GIFT, WAIT_GIFT_MENU, CLICK_TOKEN, CLOSE_GIFT_MENU,
+        SEND_GIFT, WAIT_GIFT_MENU, CLICK_TOKEN, WAIT_TOKEN_APPEAR, CLOSE_GIFT_MENU,
         WAIT_CONFIRM_MENU, CLICK_CONFIRM
     }
     private State state = State.IDLE;
@@ -155,7 +155,18 @@ public class GrinderBotClient implements ClientModInitializer {
             case CLICK_TOKEN:
                 clickGiftTokenSlot(client);
                 actionTickCounter = 0;
-                state = State.CLOSE_GIFT_MENU;
+                state = State.WAIT_TOKEN_APPEAR;
+                break;
+            case WAIT_TOKEN_APPEAR:
+                actionTickCounter++;
+                if (giftSlotFilled(client)) {
+                    actionTickCounter = 0;
+                    state = State.CLOSE_GIFT_MENU;
+                } else if (actionTickCounter > 40) { // ~2 seconds, safety timeout
+                    notify("§cToken never appeared in gift slot — closing anyway");
+                    actionTickCounter = 0;
+                    state = State.CLOSE_GIFT_MENU;
+                }
                 break;
 
             case CLOSE_GIFT_MENU:
@@ -188,6 +199,20 @@ public class GrinderBotClient implements ClientModInitializer {
         }
     }
 
+    private boolean giftSlotFilled(Minecraft client) {
+        if (!(client.screen instanceof AbstractContainerScreen<?> screen)) return false;
+        AbstractContainerMenu menu = screen.getMenu();
+        LocalPlayer player = client.player;
+
+        for (var slot : menu.slots) {
+            // Only check the container's own slots, not the player's inventory row
+            if (slot.container != player.getInventory() && !slot.getItem().isEmpty()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private void doActiveTick(Minecraft client) {
         LocalPlayer player = client.player;
 
@@ -200,16 +225,16 @@ public class GrinderBotClient implements ClientModInitializer {
             return;
         }
 
-         // 1. Grind Tokens take priority once we've stacked up enough of them
-int tokenCount = countGrindTokens(player);
-if (tokenCount >= TOKEN_THRESHOLD) {
-    notify("§e" + tokenCount + " Grind Tokens collected — pausing to gift");
-    if (isBaritoneActive()) {
-        getBaritone().getPathingBehavior().cancelEverything();
-    }
-    state = State.SEND_GIFT;
-    return;
-}
+        // 1. Grind Tokens take priority once we've stacked up enough of them
+        int tokenCount = countGrindTokens(player);
+        if (tokenCount >= TOKEN_THRESHOLD) {
+            notify("§e" + tokenCount + " Grind Tokens collected — pausing to gift");
+            if (isBaritoneActive()) {
+                getBaritone().getPathingBehavior().cancelEverything();
+            }
+            state = State.SEND_GIFT;
+            return;
+        }
 
         // 2. Find nearest endermite within search radius
         AABB searchBox = player.getBoundingBox().inflate(SEARCH_RADIUS);
@@ -259,7 +284,7 @@ if (tokenCount >= TOKEN_THRESHOLD) {
     private void faceEntity(LocalPlayer player, Endermite target) {
         double dx = target.getX() - player.getX();
         double dy = (target.getY() + target.getEyeHeight() * 0.5)
-                - (player.getY() + player.getEyeHeight());
+            - (player.getY() + player.getEyeHeight());
         double dz = target.getZ() - player.getZ();
 
         double horizontalDist = Math.sqrt(dx * dx + dz * dz);
@@ -271,28 +296,28 @@ if (tokenCount >= TOKEN_THRESHOLD) {
     }
 
     private int countGrindTokens(LocalPlayer player) {
-    var inventory = player.getInventory();
-    int count = 0;
-    for (int i = 0; i < 36; i++) {
-        ItemStack stack = inventory.getItem(i);
-        if (!stack.isEmpty() && isGrindToken(stack)) {
-            count += stack.getCount();
+        var inventory = player.getInventory();
+        int count = 0;
+        for (int i = 0; i < 36; i++) {
+            ItemStack stack = inventory.getItem(i);
+            if (!stack.isEmpty() && isGrindToken(stack)) {
+                count += stack.getCount();
+            }
         }
+        return count;
     }
-    return count;
-}
 
     private boolean isGrindToken(ItemStack stack) {
         Component name = stack.getHoverName();
         return name != null && name.getString().contains(GRIND_TOKEN_NAME);
     }
 
-private void clickGiftTokenSlot(Minecraft client) {
-    if (!(client.screen instanceof AbstractContainerScreen<?> screen)) return;
-    AbstractContainerMenu menu = screen.getMenu();
-    client.gameMode.handleInventoryMouseClick(
-            menu.containerId, GIFT_MENU_TOKEN_SLOT, 0, ClickType.PICKUP, client.player);
-}
+    private void clickGiftTokenSlot(Minecraft client) {
+        if (!(client.screen instanceof AbstractContainerScreen<?> screen)) return;
+        AbstractContainerMenu menu = screen.getMenu();
+        client.gameMode.handleInventoryMouseClick(
+                menu.containerId, GIFT_MENU_TOKEN_SLOT, 0, ClickType.PICKUP, client.player);
+    }
 
     private void clickSlotZero(Minecraft client) {
         if (!(client.screen instanceof AbstractContainerScreen<?> screen)) return;
@@ -308,7 +333,7 @@ private void clickGiftTokenSlot(Minecraft client) {
     private boolean isBaritoneActive() {
         IBaritone baritone = getBaritone();
         return baritone.getPathingBehavior().isPathing()
-                || baritone.getPathingBehavior().hasPath();
+            || baritone.getPathingBehavior().hasPath();
     }
 
     private IBaritone getBaritone() {
