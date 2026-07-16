@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "grinderbot",
+  "version": "1.0.0",
+  "name": "Grinder Bot",
+  "description": "Grinds Grind Tokens in Warzone",
+  "authors": [
+    "You"
+  ],
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "com.example.grinderbot.GrinderBotClient"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "~1.21.11",
+    "fabric-api": "*"
+  }
+}
+
+

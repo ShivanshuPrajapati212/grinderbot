@@ -1,0 +1,15 @@
+pluginManagement {
+    repositories {
+        maven {
+            url = 'https://maven.fabricmc.net/'
+        }
+        mavenCentral()
+        flatDir {
+        dirs 'libs'
+    }
+
+    }
+}
+rootProject.name = "GrinderBot"
+
+
