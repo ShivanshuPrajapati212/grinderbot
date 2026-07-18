@@ -16,6 +16,12 @@ import net.minecraft.world.inventory.ClickType;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.phys.AABB;
 
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
+import net.minecraft.world.effect.MobEffectInstance;
+import net.minecraft.world.effect.MobEffects;
+import net.minecraft.world.item.Items;
+
 import baritone.api.BaritoneAPI;
 import baritone.api.IBaritone;
 
@@ -33,13 +39,23 @@ public class GrinderBotClient implements ClientModInitializer {
     private static final int WAIT_GOTO_START_TIMEOUT = 40;
     private static final int WAIT_MENU_TIMEOUT = 100;
 
+    private static final int GAPPLE_HOTBAR_SLOT = 8;      // reserved hotbar slot for swapping food in
+    private static final int REGEN_REFRESH_THRESHOLD = 20; // ticks left before we consider it "ending" (1s)
+    private static final int GAPPLE_EAT_TIMEOUT = 40;       // ~2s safety timeout for the eat animation
+    private int preGappleHotbarSlot = 0;
+    private static final int SWAP_SETTLE_TICKS = 5;    // wait after swapping gapple into hotbar
+    private static final int RESTORE_SETTLE_TICKS = 5;  // wait after switching back
+    private int pendingGappleInventoryIndex = -1;
+    private static final int GAPPLE_EAT_DURATION_TICKS = 32; // vanilla eat animation length
+
     // ---- State machine ----
     private enum State {
         IDLE,
         WAIT_FOR_GOTO_START, WAIT_FOR_ARRIVAL,
         ACTIVE,
-        SEND_GIFT, WAIT_GIFT_MENU, CLICK_TOKEN, WAIT_TOKEN_APPEAR, CLOSE_GIFT_MENU,
-        WAIT_CONFIRM_MENU, CLICK_CONFIRM
+        GAPPLE_SWAP, WAIT_AFTER_SWAP, GAPPLE_EAT, WAIT_GAPPLE_FINISH, WAIT_AFTER_RESTORE,
+        SEND_GIFT, WAIT_GIFT_MENU, PRE_CLICK_DELAY, CLICK_TOKEN, WAIT_TOKEN_APPEAR, CLOSE_GIFT_MENU,
+        WAIT_CONFIRM_MENU, WAIT_CONFIRM_ICON, CLICK_CONFIRM
     }
     private State state = State.IDLE;
 
@@ -135,6 +151,52 @@ public class GrinderBotClient implements ClientModInitializer {
                 doActiveTick(client);
                 break;
 
+            case GAPPLE_SWAP:
+                swapGappleIntoHotbar(client, pendingGappleInventoryIndex);
+                actionTickCounter = 0;
+                state = State.WAIT_AFTER_SWAP;
+                break;
+
+            case WAIT_AFTER_SWAP:
+                actionTickCounter++;
+                if (actionTickCounter >= SWAP_SETTLE_TICKS) {
+                    actionTickCounter = 0;
+                    state = State.GAPPLE_EAT;
+                }
+                break;
+
+            case GAPPLE_EAT:
+                // Make sure Baritone is fully silent during the eat — re-cancel every tick
+                // leading into this, in case anything queued a path after our first cancel
+                getBaritone().getPathingBehavior().cancelEverything();
+                getBaritone().getInputOverrideHandler().clearAllKeys();
+                selectAndEatGapple(client);
+                actionTickCounter = 0;
+                state = State.WAIT_GAPPLE_FINISH;
+                break;
+
+            case WAIT_GAPPLE_FINISH:
+                getBaritone().getPathingBehavior().cancelEverything();
+                getBaritone().getInputOverrideHandler().clearAllKeys();
+
+                actionTickCounter++;
+                if (actionTickCounter >= GAPPLE_EAT_DURATION_TICKS) {
+                    client.options.keyUse.setDown(false); // release the forced key state
+                    restoreHeldSlot(client);
+                    actionTickCounter = 0;
+                    state = State.WAIT_AFTER_RESTORE;
+                }
+                break;
+
+            case WAIT_AFTER_RESTORE:
+                actionTickCounter++;
+                if (actionTickCounter >= RESTORE_SETTLE_TICKS) {
+                    notify("§aGapple eaten — resuming grind");
+                    attackTickCounter = 0;
+                    state = State.ACTIVE;
+                }
+                break;
+
             case SEND_GIFT:
                 sendCommand(client, "gift " + GIFT_TARGET);
                 giftScreenOpened = false;
@@ -145,10 +207,18 @@ public class GrinderBotClient implements ClientModInitializer {
             case WAIT_GIFT_MENU:
                 actionTickCounter++;
                 if (giftScreenOpened) {
-                    state = State.CLICK_TOKEN;
+                    actionTickCounter = 0;
+                    state = State.PRE_CLICK_DELAY; // new buffer state
                 } else if (actionTickCounter > WAIT_MENU_TIMEOUT) {
                     notify("§cGift menu never opened — resuming grind");
                     state = State.ACTIVE;
+                }
+                break;
+
+            case PRE_CLICK_DELAY:
+                actionTickCounter++;
+                if (actionTickCounter > 5) { // quarter-second buffer for slot sync
+                    state = State.CLICK_TOKEN;
                 }
                 break;
 
@@ -181,14 +251,26 @@ public class GrinderBotClient implements ClientModInitializer {
             case WAIT_CONFIRM_MENU:
                 actionTickCounter++;
                 if (confirmScreenOpened) {
-                    state = State.CLICK_CONFIRM;
+                    actionTickCounter = 0;
+                    state = State.WAIT_CONFIRM_ICON;
                 } else if (actionTickCounter > 60) {
                     state = State.ACTIVE;
                 }
                 break;
+            case WAIT_CONFIRM_ICON:
+                actionTickCounter++;
+                if (confirmSlotFilled(client, 11)) {
+                    actionTickCounter = 0;
+                    state = State.CLICK_CONFIRM;
+                } else if (actionTickCounter > 40) { // ~2 second safety timeout
+                    notify("§cConfirm icon never appeared — closing anyway");
+                    actionTickCounter = 0;
+                    state = State.CLICK_CONFIRM;
+                }
+                break;
 
             case CLICK_CONFIRM:
-                clickSlotZero(client);
+                clickConfirmSlot(client);
                 if (client.screen != null) {
                     client.player.closeContainer();
                 }
@@ -197,6 +279,13 @@ public class GrinderBotClient implements ClientModInitializer {
                 state = State.ACTIVE;
                 break;
         }
+    }
+
+    private boolean confirmSlotFilled(Minecraft client, int slotIndex) {
+        if (!(client.screen instanceof AbstractContainerScreen<?> screen)) return false;
+        AbstractContainerMenu menu = screen.getMenu();
+        if (slotIndex >= menu.slots.size()) return false;
+        return !menu.slots.get(slotIndex).getItem().isEmpty();
     }
 
     private boolean giftSlotFilled(Minecraft client) {
@@ -213,6 +302,7 @@ public class GrinderBotClient implements ClientModInitializer {
         return false;
     }
 
+
     private void doActiveTick(Minecraft client) {
         LocalPlayer player = client.player;
 
@@ -223,6 +313,21 @@ public class GrinderBotClient implements ClientModInitializer {
                 getBaritone().getCommandManager().execute("stop");
             }
             return;
+        }
+
+
+        if (needsGapple(player)) {
+            int gappleIndex = findGappleInventoryIndex(player);
+            if (gappleIndex != -1) {
+                notify("§dRegeneration low — eating gapple");
+                if (isBaritoneActive()) {
+                    getBaritone().getPathingBehavior().cancelEverything();
+                }
+                pendingGappleInventoryIndex = gappleIndex;
+                actionTickCounter = 0;
+                state = State.GAPPLE_SWAP;
+                return;
+            }
         }
 
         // 1. Grind Tokens take priority once we've stacked up enough of them
@@ -315,15 +420,24 @@ public class GrinderBotClient implements ClientModInitializer {
     private void clickGiftTokenSlot(Minecraft client) {
         if (!(client.screen instanceof AbstractContainerScreen<?> screen)) return;
         AbstractContainerMenu menu = screen.getMenu();
-        client.gameMode.handleInventoryMouseClick(
-                menu.containerId, GIFT_MENU_TOKEN_SLOT, 0, ClickType.PICKUP, client.player);
+        LocalPlayer player = client.player;
+
+        for (var slot : menu.slots) {
+            if (slot.container == player.getInventory() && !slot.getItem().isEmpty()
+                    && isGrindToken(slot.getItem())) {
+                client.gameMode.handleInventoryMouseClick(
+                        menu.containerId, slot.index, 0, ClickType.QUICK_MOVE, player);
+                return;
+                    }
+        }
+        notify("§cCouldn't find token slot in gift menu");
     }
 
-    private void clickSlotZero(Minecraft client) {
+    private void clickConfirmSlot(Minecraft client) {
         if (!(client.screen instanceof AbstractContainerScreen<?> screen)) return;
         AbstractContainerMenu menu = screen.getMenu();
         client.gameMode.handleInventoryMouseClick(
-                menu.containerId, 0, 0, ClickType.PICKUP, client.player);
+                menu.containerId, 11, 0, ClickType.QUICK_MOVE, client.player);
     }
 
     private void sendCommand(Minecraft client, String command) {
@@ -342,5 +456,69 @@ public class GrinderBotClient implements ClientModInitializer {
 
     private void notify(String msg) {
         Minecraft.getInstance().gui.getChat().addMessage(Component.literal(msg));
+    }
+
+    private boolean needsGapple(LocalPlayer player) {
+        MobEffectInstance regen = player.getEffect(MobEffects.REGENERATION);
+        return regen == null || regen.getDuration() <= REGEN_REFRESH_THRESHOLD;
+    }
+
+    private int findGappleInventoryIndex(LocalPlayer player) {
+        var inventory = player.getInventory();
+        for (int i = 0; i < 36; i++) {
+            ItemStack stack = inventory.getItem(i);
+            if (!stack.isEmpty() && stack.getItem() == Items.ENCHANTED_GOLDEN_APPLE) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private int toMenuSlotIndex(int inventoryIndex) {
+        // Inventory class: 0-8 hotbar, 9-35 main storage
+        // InventoryMenu:    9-35 main storage (same), 36-44 hotbar
+        return inventoryIndex < 9 ? inventoryIndex + 36 : inventoryIndex;
+    }
+
+    private void eatGapple(Minecraft client, int inventoryIndex) {
+        LocalPlayer player = client.player;
+        int menuSlot = toMenuSlotIndex(inventoryIndex);
+
+        preGappleHotbarSlot = player.getInventory().getSelectedSlot(); // remember what we were holding
+
+        // Swap the gapple into our reserved hotbar slot
+        client.gameMode.handleInventoryMouseClick(
+                player.inventoryMenu.containerId, menuSlot, GAPPLE_HOTBAR_SLOT, ClickType.SWAP, player);
+
+        player.getInventory().setSelectedSlot(GAPPLE_HOTBAR_SLOT);
+        player.connection.send(new ServerboundSetCarriedItemPacket(GAPPLE_HOTBAR_SLOT));
+
+        client.gameMode.useItem(player, InteractionHand.MAIN_HAND);
+    }
+
+    private void restoreHeldSlot(Minecraft client) {
+        LocalPlayer player = client.player;
+        player.getInventory().setSelectedSlot(preGappleHotbarSlot);
+        player.connection.send(new ServerboundSetCarriedItemPacket(preGappleHotbarSlot));
+    }
+
+    private void swapGappleIntoHotbar(Minecraft client, int inventoryIndex) {
+        LocalPlayer player = client.player;
+        int menuSlot = toMenuSlotIndex(inventoryIndex);
+
+        preGappleHotbarSlot = player.getInventory().getSelectedSlot();
+
+        client.gameMode.handleInventoryMouseClick(
+                player.inventoryMenu.containerId, menuSlot, GAPPLE_HOTBAR_SLOT, ClickType.SWAP, player);
+    }
+
+    private void selectAndEatGapple(Minecraft client) {
+        LocalPlayer player = client.player;
+
+        player.getInventory().setSelectedSlot(GAPPLE_HOTBAR_SLOT);
+        player.connection.send(new ServerboundSetCarriedItemPacket(GAPPLE_HOTBAR_SLOT));
+
+        client.options.keyUse.setDown(true); // trick vanilla into thinking right-click is held
+        client.gameMode.useItem(player, InteractionHand.MAIN_HAND);
     }
 }
