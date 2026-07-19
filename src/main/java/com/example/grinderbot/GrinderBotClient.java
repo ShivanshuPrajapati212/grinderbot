@@ -15,6 +15,15 @@ import net.minecraft.world.inventory.AbstractContainerMenu;
 import net.minecraft.world.inventory.ClickType;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.phys.AABB;
+import net.minecraft.world.entity.EquipmentSlot;
+import net.minecraft.world.entity.decoration.ArmorStand;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.world.item.equipment.Equippable;
+import net.minecraft.network.protocol.game.ServerboundClientCommandPacket;
+import net.minecraft.client.gui.screens.DeathScreen;
+import java.util.Queue;
+import java.util.ArrayDeque;
+import java.util.function.Predicate;
 
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
@@ -47,6 +56,22 @@ public class GrinderBotClient implements ClientModInitializer {
     private static final int RESTORE_SETTLE_TICKS = 5;  // wait after switching back
     private int pendingGappleInventoryIndex = -1;
     private static final int GAPPLE_EAT_DURATION_TICKS = 32; // vanilla eat animation length
+                                                             //
+
+    private static final int PV_LOAD_TICKS = 60;              // wait after /pv 1 for world to load
+    private static final double ARMOR_STAND_SEARCH_RADIUS = 8.0;
+    private static final int MAX_ARMOR_STAND_SEARCH_ATTEMPTS = 20;
+    private static final int ACTION_DELAY_TICKS = 6;           // delay between queued clicks
+
+
+    private boolean regearing = false;
+    private String lastGrindCoords = null;       // set whenever %grind x y z is used
+    private int armorStandSearchAttempts = 0;
+    private volatile boolean genericScreenOpened = false;
+
+    private final Queue<Runnable> pendingActions = new ArrayDeque<>();
+    private int actionDelayCounter = 0;
+    private State queueFinishedState = State.IDLE;
 
     // ---- State machine ----
     private enum State {
@@ -55,7 +80,12 @@ public class GrinderBotClient implements ClientModInitializer {
         ACTIVE,
         GAPPLE_SWAP, WAIT_AFTER_SWAP, GAPPLE_EAT, WAIT_GAPPLE_FINISH, WAIT_AFTER_RESTORE,
         SEND_GIFT, WAIT_GIFT_MENU, PRE_CLICK_DELAY, CLICK_TOKEN, WAIT_TOKEN_APPEAR, CLOSE_GIFT_MENU,
-        WAIT_CONFIRM_MENU, WAIT_CONFIRM_ICON, CLICK_CONFIRM
+        WAIT_CONFIRM_MENU, WAIT_CONFIRM_ICON, CLICK_CONFIRM,
+        // ---- new: death / regear ----
+        WAIT_RESPAWN, SEND_PV, WAIT_PV_DELAY,
+        INTERACT_ARMOR_STAND, WAIT_KIT_MENU, WAIT_KIT_SETTLE, EQUIP_GEAR,
+        QUEUE_PROCESSING,
+        RETURN_TO_GRIND_GOTO, WAIT_RETURN_GOTO_START, WAIT_RETURN_ARRIVAL
     }
     private State state = State.IDLE;
 
@@ -115,6 +145,8 @@ public class GrinderBotClient implements ClientModInitializer {
                     giftScreenOpened = true;
                 } else if (state == State.WAIT_CONFIRM_MENU) {
                     confirmScreenOpened = true;
+                } else if (state == State.WAIT_KIT_MENU) {
+                    genericScreenOpened = true;
                 }
             }
         });
@@ -124,6 +156,15 @@ public class GrinderBotClient implements ClientModInitializer {
 
     private void onTick(Minecraft client) {
         if (client.player == null || client.level == null) return;
+
+        if (!regearing && client.player.isDeadOrDying()) {
+            regearing = true;
+            notify("§4Died — respawning and regearing");
+            triggerRespawn(client);
+            actionTickCounter = 0;
+            state = State.WAIT_RESPAWN;
+        }
+
 
         switch (state) {
             case IDLE:
@@ -278,6 +319,120 @@ public class GrinderBotClient implements ClientModInitializer {
                 attackTickCounter = 0;
                 state = State.ACTIVE;
                 break;
+
+            case WAIT_RESPAWN:
+                actionTickCounter++;
+                if (!client.player.isDeadOrDying()) {
+                    actionTickCounter = 0;
+                    sendCommand(client, "pv 1");
+                    state = State.WAIT_PV_DELAY;
+                } else if (actionTickCounter % 20 == 0) {
+                    triggerRespawn(client); // retry pressing respawn periodically
+                }
+                break;
+
+            case WAIT_PV_DELAY:
+                actionTickCounter++;
+                if (actionTickCounter >= PV_LOAD_TICKS) {
+                    actionTickCounter = 0;
+                    armorStandSearchAttempts = 0;
+                    state = State.INTERACT_ARMOR_STAND;
+                }
+                break;
+
+            case INTERACT_ARMOR_STAND:
+                ArmorStand stand = findNearestArmorStand(client);
+                if (stand != null) {
+                    client.gameMode.interact(client.player, stand, InteractionHand.MAIN_HAND);
+                    genericScreenOpened = false;
+                    actionTickCounter = 0;
+                    state = State.WAIT_KIT_MENU;
+                } else {
+                    armorStandSearchAttempts++;
+                    if (armorStandSearchAttempts > MAX_ARMOR_STAND_SEARCH_ATTEMPTS) {
+                        notify("§cNo armor stand found nearby — aborting regear");
+                        regearing = false;
+                        state = State.IDLE;
+                    }
+                }
+                break;
+
+            case WAIT_KIT_MENU:
+                actionTickCounter++;
+                if (genericScreenOpened) {
+                    buildKitClickQueue(client);
+                    actionDelayCounter = 0;
+                    queueFinishedState = State.WAIT_KIT_SETTLE;
+                    state = State.QUEUE_PROCESSING;
+                } else if (actionTickCounter > WAIT_MENU_TIMEOUT) {
+                    notify("§cKit menu never opened — aborting regear");
+                    regearing = false;
+                    state = State.IDLE;
+                }
+                break;
+
+            case WAIT_KIT_SETTLE:
+                actionTickCounter++;
+                if (actionTickCounter >= 10) {
+                    if (client.screen != null) client.player.closeContainer();
+                    genericScreenOpened = false;
+                    actionTickCounter = 0;
+                    state = State.EQUIP_GEAR;
+                }
+                break;
+
+            case EQUIP_GEAR:
+                buildEquipQueue(client);
+                actionDelayCounter = 0;
+                queueFinishedState = State.RETURN_TO_GRIND_GOTO;
+                state = State.QUEUE_PROCESSING;
+                break;
+
+            case QUEUE_PROCESSING:
+                actionDelayCounter++;
+                if (actionDelayCounter >= ACTION_DELAY_TICKS) {
+                    actionDelayCounter = 0;
+                    Runnable next = pendingActions.poll();
+                    if (next != null) {
+                        next.run();
+                    } else {
+                        state = queueFinishedState;
+                    }
+                }
+                break;
+
+            case RETURN_TO_GRIND_GOTO:
+                if (lastGrindCoords != null) {
+                    notify("§bGeared up — returning to grind spot");
+                    getBaritone().getCommandManager().execute("goto " + lastGrindCoords);
+                    actionTickCounter = 0;
+                    state = State.WAIT_RETURN_GOTO_START;
+                } else {
+                    notify("§cNo saved grind coords — use %grind x y z once");
+                    regearing = false;
+                    state = State.IDLE;
+                }
+                break;
+
+            case WAIT_RETURN_GOTO_START:
+                actionTickCounter++;
+                if (isBaritoneActive()) {
+                    state = State.WAIT_RETURN_ARRIVAL;
+                } else if (actionTickCounter > WAIT_GOTO_START_TIMEOUT) {
+                    notify("§cReturn goto never started");
+                    regearing = false;
+                    state = State.IDLE;
+                }
+                break;
+
+            case WAIT_RETURN_ARRIVAL:
+                if (!isBaritoneActive()) {
+                    notify("§aBack at grind spot — resuming");
+                    regearing = false;
+                    attackTickCounter = 0;
+                    state = State.ACTIVE;
+                }
+                break;
         }
     }
 
@@ -314,6 +469,17 @@ public class GrinderBotClient implements ClientModInitializer {
             }
             return;
         }
+
+        if (!regearing && isMissingGear(player)) {
+            regearing = true;
+            notify("§cMissing gear — starting regear sequence");
+            if (isBaritoneActive()) getBaritone().getPathingBehavior().cancelEverything();
+            sendCommand(client, "pv 1");
+            actionTickCounter = 0;
+            state = State.WAIT_PV_DELAY;
+            return;
+        }
+
 
 
         if (needsGapple(player)) {
@@ -520,5 +686,107 @@ public class GrinderBotClient implements ClientModInitializer {
 
         client.options.keyUse.setDown(true); // trick vanilla into thinking right-click is held
         client.gameMode.useItem(player, InteractionHand.MAIN_HAND);
+    }
+
+    private void triggerRespawn(Minecraft client) {
+        client.player.connection.send(
+                new ServerboundClientCommandPacket(ServerboundClientCommandPacket.Action.PERFORM_RESPAWN));
+    }
+
+    private boolean isMissingGear(LocalPlayer player) {
+        boolean noChest = player.getItemBySlot(EquipmentSlot.CHEST).isEmpty();
+        boolean noSword = !hasSwordInHotbar(player);
+        return noChest || noSword;
+    }
+
+    private boolean hasSwordInHotbar(LocalPlayer player) {
+        for (int i = 0; i < 9; i++) {
+            ItemStack stack = player.getInventory().getItem(i);
+            if (!stack.isEmpty() && stack.has(DataComponents.WEAPON)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private ArmorStand findNearestArmorStand(Minecraft client) {
+        LocalPlayer player = client.player;
+        AABB box = player.getBoundingBox().inflate(ARMOR_STAND_SEARCH_RADIUS);
+        var candidates = client.level.getEntitiesOfClass(ArmorStand.class, box);
+
+        ArmorStand nearest = null;
+        double nearestDistSq = Double.MAX_VALUE;
+        for (ArmorStand stand : candidates) {
+            double distSq = stand.distanceToSqr(player);
+            if (distSq < nearestDistSq) {
+                nearestDistSq = distSq;
+                nearest = stand;
+            }
+        }
+        return nearest;
+    }
+
+    private void buildKitClickQueue(Minecraft client) {
+        pendingActions.clear();
+        if (!(client.screen instanceof AbstractContainerScreen<?> screen)) return;
+        AbstractContainerMenu menu = screen.getMenu();
+        LocalPlayer player = client.player;
+
+        for (var slot : menu.slots) {
+            if (slot.container != player.getInventory() && !slot.getItem().isEmpty()) {
+                int slotIndex = slot.index;
+                pendingActions.add(() -> Minecraft.getInstance().gameMode.handleInventoryMouseClick(
+                            menu.containerId, slotIndex, 0, ClickType.QUICK_MOVE, player));
+            }
+        }
+    }
+
+    private void buildEquipQueue(Minecraft client) {
+        pendingActions.clear();
+        LocalPlayer player = client.player;
+        AbstractContainerMenu menu = player.inventoryMenu;
+
+        queueArmorMove(menu, player, EquipmentSlot.HEAD, 5);
+        queueArmorMove(menu, player, EquipmentSlot.CHEST, 6);
+        queueArmorMove(menu, player, EquipmentSlot.LEGS, 7);
+        queueArmorMove(menu, player, EquipmentSlot.FEET, 8);
+
+        queueItemToHotbarSlot(menu, player, stack -> stack.has(DataComponents.WEAPON), 36);
+        queueItemToHotbarSlot(menu, player, stack -> stack.getItem() == Items.ENCHANTED_GOLDEN_APPLE, 44);
+    }
+
+    private void queueArmorMove(AbstractContainerMenu menu, LocalPlayer player,
+            EquipmentSlot equipSlot, int armorMenuIndex) {
+        for (var slot : menu.slots) {
+            if (slot.index < 9 || slot.index > 44) continue;
+            ItemStack stack = slot.getItem();
+            if (stack.isEmpty()) continue;
+
+            Equippable equippable = stack.get(DataComponents.EQUIPPABLE);
+            if (equippable != null && equippable.slot() == equipSlot) {
+                int sourceIndex = slot.index;
+                pendingActions.add(() -> Minecraft.getInstance().gameMode.handleInventoryMouseClick(
+                            menu.containerId, sourceIndex, 0, ClickType.PICKUP, player));
+                pendingActions.add(() -> Minecraft.getInstance().gameMode.handleInventoryMouseClick(
+                            menu.containerId, armorMenuIndex, 0, ClickType.PICKUP, player));
+                return;
+            }
+        }
+    }
+
+    private void queueItemToHotbarSlot(AbstractContainerMenu menu, LocalPlayer player,
+            Predicate<ItemStack> predicate, int destMenuIndex) {
+        for (var slot : menu.slots) {
+            if (slot.index < 9 || slot.index > 44 || slot.index == destMenuIndex) continue;
+            ItemStack stack = slot.getItem();
+            if (!stack.isEmpty() && predicate.test(stack)) {
+                int sourceIndex = slot.index;
+                pendingActions.add(() -> Minecraft.getInstance().gameMode.handleInventoryMouseClick(
+                            menu.containerId, sourceIndex, 0, ClickType.PICKUP, player));
+                pendingActions.add(() -> Minecraft.getInstance().gameMode.handleInventoryMouseClick(
+                            menu.containerId, destMenuIndex, 0, ClickType.PICKUP, player));
+                return;
+            }
+        }
     }
 }
