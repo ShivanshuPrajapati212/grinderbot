@@ -7,6 +7,7 @@ import net.fabricmc.fabric.api.client.screen.v1.ScreenEvents;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
+import net.minecraft.client.gui.screens.inventory.InventoryScreen;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.InteractionHand;
@@ -16,16 +17,14 @@ import net.minecraft.world.inventory.ClickType;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.entity.EquipmentSlot;
-import net.minecraft.world.entity.decoration.ArmorStand;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.world.item.equipment.Equippable;
 import net.minecraft.network.protocol.game.ServerboundClientCommandPacket;
-import net.minecraft.client.gui.screens.DeathScreen;
+import net.minecraft.tags.ItemTags;
 import java.util.Queue;
 import java.util.ArrayDeque;
 import java.util.function.Predicate;
 
-import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
 import net.minecraft.world.effect.MobEffectInstance;
 import net.minecraft.world.effect.MobEffects;
@@ -43,30 +42,25 @@ public class GrinderBotClient implements ClientModInitializer {
     private static final String GRIND_TOKEN_NAME = "Grind Token";
     private static final String GIFT_TARGET = "shivanshu7";
     private static final int TOKEN_THRESHOLD = 5;
-    private static final int GIFT_MENU_TOKEN_SLOT = 11;
 
     private static final int WAIT_GOTO_START_TIMEOUT = 40;
     private static final int WAIT_MENU_TIMEOUT = 100;
 
     private static final int GAPPLE_HOTBAR_SLOT = 8;      // reserved hotbar slot for swapping food in
     private static final int REGEN_REFRESH_THRESHOLD = 20; // ticks left before we consider it "ending" (1s)
-    private static final int GAPPLE_EAT_TIMEOUT = 40;       // ~2s safety timeout for the eat animation
     private int preGappleHotbarSlot = 0;
     private static final int SWAP_SETTLE_TICKS = 5;    // wait after swapping gapple into hotbar
     private static final int RESTORE_SETTLE_TICKS = 5;  // wait after switching back
     private int pendingGappleInventoryIndex = -1;
     private static final int GAPPLE_EAT_DURATION_TICKS = 32; // vanilla eat animation length
-                                                             //
 
-    private static final int PV_LOAD_TICKS = 60;              // wait after /pv 1 for world to load
-    private static final double ARMOR_STAND_SEARCH_RADIUS = 8.0;
-    private static final int MAX_ARMOR_STAND_SEARCH_ATTEMPTS = 20;
     private static final int ACTION_DELAY_TICKS = 6;           // delay between queued clicks
 
+    private static final String KIT_VOUCHER_NAME = "Kit";      // matches any voucher containing "Kit"
+    private static final int VOUCHER_HOTBAR_SLOT = 7;          // reserved slot to hold the voucher temporarily
 
     private boolean regearing = false;
     private String lastGrindCoords = null;       // set whenever %grind x y z is used
-    private int armorStandSearchAttempts = 0;
     private volatile boolean genericScreenOpened = false;
 
     private final Queue<Runnable> pendingActions = new ArrayDeque<>();
@@ -81,9 +75,13 @@ public class GrinderBotClient implements ClientModInitializer {
         GAPPLE_SWAP, WAIT_AFTER_SWAP, GAPPLE_EAT, WAIT_GAPPLE_FINISH, WAIT_AFTER_RESTORE,
         SEND_GIFT, WAIT_GIFT_MENU, PRE_CLICK_DELAY, CLICK_TOKEN, WAIT_TOKEN_APPEAR, CLOSE_GIFT_MENU,
         WAIT_CONFIRM_MENU, WAIT_CONFIRM_ICON, CLICK_CONFIRM,
-        // ---- new: death / regear ----
-        WAIT_RESPAWN, SEND_PV, WAIT_PV_DELAY,
-        INTERACT_ARMOR_STAND, WAIT_KIT_MENU, WAIT_KIT_SETTLE, EQUIP_GEAR,
+        // ---- death / regear ----
+        WAIT_RESPAWN,
+        // ---- vault -> extract voucher -> use voucher -> gear lands directly ----
+        WAIT_VAULT_MENU, VAULT_PRE_CLICK_DELAY, EXTRACT_VOUCHER, WAIT_VOUCHER_APPEAR, CLOSE_VAULT_MENU,
+        SELECT_VOUCHER, WAIT_AFTER_SELECT, USE_VOUCHER, WAIT_KIT_SETTLE,
+        OPEN_INV_SYNC, WAIT_INV_SYNC, CLOSE_INV_SYNC,
+        EQUIP_GEAR,
         QUEUE_PROCESSING,
         RETURN_TO_GRIND_GOTO, WAIT_RETURN_GOTO_START, WAIT_RETURN_ARRIVAL
     }
@@ -109,13 +107,13 @@ public class GrinderBotClient implements ClientModInitializer {
             String[] parts = command.split("\\s+");
 
             if (parts.length == 4) {
-                // %grind x y z -> initial move to grinder area, then auto-start
+                // %grind x y z -> initial move to grinder area, then auto-start on arrival
                 String coords = parts[1] + " " + parts[2] + " " + parts[3];
+                lastGrindCoords = coords;
                 notify("§bHeading to grinder at " + coords);
                 getBaritone().getPathingBehavior().cancelEverything();
                 getBaritone().getCommandManager().execute("stop");
                 getBaritone().getCommandManager().execute("goto " + coords);
-                running = true;
                 actionTickCounter = 0;
                 state = State.WAIT_FOR_GOTO_START;
 
@@ -126,11 +124,7 @@ public class GrinderBotClient implements ClientModInitializer {
                 notify("§cGrinding stopped");
 
             } else if (parts.length == 2 && parts[1].equalsIgnoreCase("start")) {
-                running = true;
-                if (state == State.IDLE) {
-                    state = State.ACTIVE; // resume from current position, auto-seeks target
-                }
-                notify("§aGrinding resumed");
+                resumeGrinding();
 
             } else {
                 notify("§cUsage: %grind x y z | %grind start | %grind stop");
@@ -145,7 +139,7 @@ public class GrinderBotClient implements ClientModInitializer {
                     giftScreenOpened = true;
                 } else if (state == State.WAIT_CONFIRM_MENU) {
                     confirmScreenOpened = true;
-                } else if (state == State.WAIT_KIT_MENU) {
+                } else if (state == State.WAIT_VAULT_MENU) {
                     genericScreenOpened = true;
                 }
             }
@@ -165,7 +159,6 @@ public class GrinderBotClient implements ClientModInitializer {
             state = State.WAIT_RESPAWN;
         }
 
-
         switch (state) {
             case IDLE:
                 break; // waiting for a %grind command
@@ -182,9 +175,8 @@ public class GrinderBotClient implements ClientModInitializer {
 
             case WAIT_FOR_ARRIVAL:
                 if (!isBaritoneActive()) {
-                    notify("§aArrived — starting auto-grind");
-                    attackTickCounter = 0;
-                    state = State.ACTIVE;
+                    notify("§aArrived at grind spot");
+                    resumeGrinding(); // equivalent to running %grind start once we've arrived
                 }
                 break;
 
@@ -207,8 +199,6 @@ public class GrinderBotClient implements ClientModInitializer {
                 break;
 
             case GAPPLE_EAT:
-                // Make sure Baritone is fully silent during the eat — re-cancel every tick
-                // leading into this, in case anything queued a path after our first cancel
                 getBaritone().getPathingBehavior().cancelEverything();
                 getBaritone().getInputOverrideHandler().clearAllKeys();
                 selectAndEatGapple(client);
@@ -222,7 +212,7 @@ public class GrinderBotClient implements ClientModInitializer {
 
                 actionTickCounter++;
                 if (actionTickCounter >= GAPPLE_EAT_DURATION_TICKS) {
-                    client.options.keyUse.setDown(false); // release the forced key state
+                    client.options.keyUse.setDown(false);
                     restoreHeldSlot(client);
                     actionTickCounter = 0;
                     state = State.WAIT_AFTER_RESTORE;
@@ -249,7 +239,7 @@ public class GrinderBotClient implements ClientModInitializer {
                 actionTickCounter++;
                 if (giftScreenOpened) {
                     actionTickCounter = 0;
-                    state = State.PRE_CLICK_DELAY; // new buffer state
+                    state = State.PRE_CLICK_DELAY;
                 } else if (actionTickCounter > WAIT_MENU_TIMEOUT) {
                     notify("§cGift menu never opened — resuming grind");
                     state = State.ACTIVE;
@@ -258,7 +248,7 @@ public class GrinderBotClient implements ClientModInitializer {
 
             case PRE_CLICK_DELAY:
                 actionTickCounter++;
-                if (actionTickCounter > 5) { // quarter-second buffer for slot sync
+                if (actionTickCounter > 5) {
                     state = State.CLICK_TOKEN;
                 }
                 break;
@@ -268,12 +258,13 @@ public class GrinderBotClient implements ClientModInitializer {
                 actionTickCounter = 0;
                 state = State.WAIT_TOKEN_APPEAR;
                 break;
+
             case WAIT_TOKEN_APPEAR:
                 actionTickCounter++;
                 if (giftSlotFilled(client)) {
                     actionTickCounter = 0;
                     state = State.CLOSE_GIFT_MENU;
-                } else if (actionTickCounter > 40) { // ~2 seconds, safety timeout
+                } else if (actionTickCounter > 40) {
                     notify("§cToken never appeared in gift slot — closing anyway");
                     actionTickCounter = 0;
                     state = State.CLOSE_GIFT_MENU;
@@ -298,12 +289,13 @@ public class GrinderBotClient implements ClientModInitializer {
                     state = State.ACTIVE;
                 }
                 break;
+
             case WAIT_CONFIRM_ICON:
                 actionTickCounter++;
                 if (confirmSlotFilled(client, 11)) {
                     actionTickCounter = 0;
                     state = State.CLICK_CONFIRM;
-                } else if (actionTickCounter > 40) { // ~2 second safety timeout
+                } else if (actionTickCounter > 40) {
                     notify("§cConfirm icon never appeared — closing anyway");
                     actionTickCounter = 0;
                     state = State.CLICK_CONFIRM;
@@ -325,60 +317,119 @@ public class GrinderBotClient implements ClientModInitializer {
                 if (!client.player.isDeadOrDying()) {
                     actionTickCounter = 0;
                     sendCommand(client, "pv 1");
-                    state = State.WAIT_PV_DELAY;
-                } else if (actionTickCounter % 20 == 0) {
-                    triggerRespawn(client); // retry pressing respawn periodically
-                }
-                break;
-
-            case WAIT_PV_DELAY:
-                actionTickCounter++;
-                if (actionTickCounter >= PV_LOAD_TICKS) {
-                    actionTickCounter = 0;
-                    armorStandSearchAttempts = 0;
-                    state = State.INTERACT_ARMOR_STAND;
-                }
-                break;
-
-            case INTERACT_ARMOR_STAND:
-                ArmorStand stand = findNearestArmorStand(client);
-                if (stand != null) {
-                    client.gameMode.interact(client.player, stand, InteractionHand.MAIN_HAND);
                     genericScreenOpened = false;
-                    actionTickCounter = 0;
-                    state = State.WAIT_KIT_MENU;
-                } else {
-                    armorStandSearchAttempts++;
-                    if (armorStandSearchAttempts > MAX_ARMOR_STAND_SEARCH_ATTEMPTS) {
-                        notify("§cNo armor stand found nearby — aborting regear");
-                        regearing = false;
-                        state = State.IDLE;
-                    }
+                    state = State.WAIT_VAULT_MENU; // pv 1 opens the vault GUI directly
+                } else if (actionTickCounter % 20 == 0) {
+                    triggerRespawn(client);
                 }
                 break;
 
-            case WAIT_KIT_MENU:
+                // ---- Stage 1: open vault, extract exactly 1 Kit voucher into inventory ----
+
+            case WAIT_VAULT_MENU:
                 actionTickCounter++;
                 if (genericScreenOpened) {
-                    buildKitClickQueue(client);
-                    actionDelayCounter = 0;
-                    queueFinishedState = State.WAIT_KIT_SETTLE;
-                    state = State.QUEUE_PROCESSING;
+                    actionTickCounter = 0;
+                    state = State.VAULT_PRE_CLICK_DELAY;
                 } else if (actionTickCounter > WAIT_MENU_TIMEOUT) {
-                    notify("§cKit menu never opened — aborting regear");
+                    notify("§cVault never opened — aborting regear");
                     regearing = false;
                     state = State.IDLE;
                 }
                 break;
 
+            case VAULT_PRE_CLICK_DELAY:
+                actionTickCounter++;
+                if (actionTickCounter >= 5) {
+                    actionTickCounter = 0;
+                    state = State.EXTRACT_VOUCHER;
+                }
+                break;
+
+            case EXTRACT_VOUCHER:
+                buildSingleVoucherExtractQueue(client);
+                actionDelayCounter = 0;
+                queueFinishedState = State.WAIT_VOUCHER_APPEAR;
+                state = State.QUEUE_PROCESSING;
+                break;
+
+            case WAIT_VOUCHER_APPEAR:
+                actionTickCounter++;
+                if (findVoucherInInventory(client.player) != -1) {
+                    actionTickCounter = 0;
+                    state = State.CLOSE_VAULT_MENU;
+                } else if (actionTickCounter > 40) {
+                    notify("§cVoucher never appeared in inventory — closing anyway");
+                    actionTickCounter = 0;
+                    state = State.CLOSE_VAULT_MENU;
+                }
+                break;
+
+            case CLOSE_VAULT_MENU:
+                if (client.screen != null) {
+                    client.player.closeContainer();
+                }
+                genericScreenOpened = false;
+                actionTickCounter = 0;
+                state = State.SELECT_VOUCHER;
+                break;
+
+                // ---- Stage 2: select voucher, use it — gear lands directly in inventory ----
+
+            case SELECT_VOUCHER:
+                int voucherIndex = findVoucherInInventory(client.player);
+                if (voucherIndex == -1) {
+                    notify("§cVoucher not found — aborting regear");
+                    regearing = false;
+                    state = State.IDLE;
+                    break;
+                }
+                swapItemIntoHotbar(client, voucherIndex, VOUCHER_HOTBAR_SLOT);
+                actionTickCounter = 0;
+                state = State.WAIT_AFTER_SELECT;
+                break;
+
+            case WAIT_AFTER_SELECT:
+                actionTickCounter++;
+                if (actionTickCounter >= SWAP_SETTLE_TICKS) {
+                    actionTickCounter = 0;
+                    state = State.USE_VOUCHER;
+                }
+                break;
+
+            case USE_VOUCHER:
+                client.player.getInventory().setSelectedSlot(VOUCHER_HOTBAR_SLOT);
+                client.player.connection.send(new ServerboundSetCarriedItemPacket(VOUCHER_HOTBAR_SLOT));
+                client.gameMode.useItem(client.player, InteractionHand.MAIN_HAND);
+                actionTickCounter = 0;
+                state = State.WAIT_KIT_SETTLE; // items land directly in inventory, no menu opens
+                break;
+
             case WAIT_KIT_SETTLE:
                 actionTickCounter++;
-                if (actionTickCounter >= 10) {
-                    if (client.screen != null) client.player.closeContainer();
-                    genericScreenOpened = false;
+                if (actionTickCounter >= 20) { // ~1s for the server to grant items after use
                     actionTickCounter = 0;
-                    state = State.EQUIP_GEAR;
+                    state = State.OPEN_INV_SYNC;
                 }
+                break;
+
+            case OPEN_INV_SYNC:
+                client.setScreen(new InventoryScreen(client.player));
+                actionTickCounter = 0;
+                state = State.WAIT_INV_SYNC;
+                break;
+
+            case WAIT_INV_SYNC:
+                actionTickCounter++;
+                if (actionTickCounter >= 20) { // ~1 second, forces a full inventory sync
+                    state = State.CLOSE_INV_SYNC;
+                }
+                break;
+
+            case CLOSE_INV_SYNC:
+                if (client.screen != null) client.player.closeContainer();
+                actionTickCounter = 0;
+                state = State.EQUIP_GEAR;
                 break;
 
             case EQUIP_GEAR:
@@ -419,9 +470,11 @@ public class GrinderBotClient implements ClientModInitializer {
                 if (isBaritoneActive()) {
                     state = State.WAIT_RETURN_ARRIVAL;
                 } else if (actionTickCounter > WAIT_GOTO_START_TIMEOUT) {
-                    notify("§cReturn goto never started");
+                    // Likely already close enough that Baritone had nothing to path —
+                    // treat as arrived rather than as a failure
+                    notify("§aAlready near grind spot — resuming");
                     regearing = false;
-                    state = State.IDLE;
+                    resumeGrinding();
                 }
                 break;
 
@@ -429,11 +482,19 @@ public class GrinderBotClient implements ClientModInitializer {
                 if (!isBaritoneActive()) {
                     notify("§aBack at grind spot — resuming");
                     regearing = false;
-                    attackTickCounter = 0;
-                    state = State.ACTIVE;
+                    resumeGrinding();
                 }
                 break;
         }
+    }
+
+    /** Equivalent to typing "%grind start" — resumes/starts the auto-grind loop
+     *  from wherever the player currently is. */
+    private void resumeGrinding() {
+        running = true;
+        attackTickCounter = 0;
+        state = State.ACTIVE;
+        notify("§aGrinding resumed");
     }
 
     private boolean confirmSlotFilled(Minecraft client, int slotIndex) {
@@ -449,7 +510,6 @@ public class GrinderBotClient implements ClientModInitializer {
         LocalPlayer player = client.player;
 
         for (var slot : menu.slots) {
-            // Only check the container's own slots, not the player's inventory row
             if (slot.container != player.getInventory() && !slot.getItem().isEmpty()) {
                 return true;
             }
@@ -457,11 +517,9 @@ public class GrinderBotClient implements ClientModInitializer {
         return false;
     }
 
-
     private void doActiveTick(Minecraft client) {
         LocalPlayer player = client.player;
 
-        // Master switch check: if stopped, make sure we're not still moving, then idle
         if (!running) {
             if (isBaritoneActive()) {
                 getBaritone().getPathingBehavior().cancelEverything();
@@ -475,28 +533,13 @@ public class GrinderBotClient implements ClientModInitializer {
             notify("§cMissing gear — starting regear sequence");
             if (isBaritoneActive()) getBaritone().getPathingBehavior().cancelEverything();
             sendCommand(client, "pv 1");
+            genericScreenOpened = false;
             actionTickCounter = 0;
-            state = State.WAIT_PV_DELAY;
+            state = State.WAIT_VAULT_MENU;
             return;
         }
 
-
-
-        if (needsGapple(player)) {
-            int gappleIndex = findGappleInventoryIndex(player);
-            if (gappleIndex != -1) {
-                notify("§dRegeneration low — eating gapple");
-                if (isBaritoneActive()) {
-                    getBaritone().getPathingBehavior().cancelEverything();
-                }
-                pendingGappleInventoryIndex = gappleIndex;
-                actionTickCounter = 0;
-                state = State.GAPPLE_SWAP;
-                return;
-            }
-        }
-
-        // 1. Grind Tokens take priority once we've stacked up enough of them
+        // 1. Grind Tokens
         int tokenCount = countGrindTokens(player);
         if (tokenCount >= TOKEN_THRESHOLD) {
             notify("§e" + tokenCount + " Grind Tokens collected — pausing to gift");
@@ -507,7 +550,19 @@ public class GrinderBotClient implements ClientModInitializer {
             return;
         }
 
-        // 2. Find nearest endermite within search radius
+        // 2. Gapple — only when Baritone isn't currently mid-path for any reason
+        if (!isBaritoneActive() && needsGapple(player)) {
+            int gappleIndex = findGappleInventoryIndex(player);
+            if (gappleIndex != -1) {
+                notify("§dRegeneration low — eating gapple");
+                pendingGappleInventoryIndex = gappleIndex;
+                actionTickCounter = 0;
+                state = State.GAPPLE_SWAP;
+                return;
+            }
+        }
+
+        // 3. Find nearest endermite within search radius
         AABB searchBox = player.getBoundingBox().inflate(SEARCH_RADIUS);
         var candidates = client.level.getEntitiesOfClass(Endermite.class, searchBox);
 
@@ -522,7 +577,6 @@ public class GrinderBotClient implements ClientModInitializer {
         }
 
         if (nearest == null) {
-            // nothing to fight right now
             return;
         }
 
@@ -530,7 +584,6 @@ public class GrinderBotClient implements ClientModInitializer {
         faceEntity(player, nearest);
 
         if (distance > ATTACK_RANGE) {
-            // out of range -> path to it, but don't spam goto every tick
             if (!isBaritoneActive()) {
                 BlockPos pos = nearest.blockPosition();
                 getBaritone().getCommandManager().execute(
@@ -539,7 +592,6 @@ public class GrinderBotClient implements ClientModInitializer {
             return;
         }
 
-        // in range -> stop any movement, then attack at 10 cps
         if (isBaritoneActive()) {
             getBaritone().getPathingBehavior().cancelEverything();
         }
@@ -646,28 +698,6 @@ public class GrinderBotClient implements ClientModInitializer {
         return inventoryIndex < 9 ? inventoryIndex + 36 : inventoryIndex;
     }
 
-    private void eatGapple(Minecraft client, int inventoryIndex) {
-        LocalPlayer player = client.player;
-        int menuSlot = toMenuSlotIndex(inventoryIndex);
-
-        preGappleHotbarSlot = player.getInventory().getSelectedSlot(); // remember what we were holding
-
-        // Swap the gapple into our reserved hotbar slot
-        client.gameMode.handleInventoryMouseClick(
-                player.inventoryMenu.containerId, menuSlot, GAPPLE_HOTBAR_SLOT, ClickType.SWAP, player);
-
-        player.getInventory().setSelectedSlot(GAPPLE_HOTBAR_SLOT);
-        player.connection.send(new ServerboundSetCarriedItemPacket(GAPPLE_HOTBAR_SLOT));
-
-        client.gameMode.useItem(player, InteractionHand.MAIN_HAND);
-    }
-
-    private void restoreHeldSlot(Minecraft client) {
-        LocalPlayer player = client.player;
-        player.getInventory().setSelectedSlot(preGappleHotbarSlot);
-        player.connection.send(new ServerboundSetCarriedItemPacket(preGappleHotbarSlot));
-    }
-
     private void swapGappleIntoHotbar(Minecraft client, int inventoryIndex) {
         LocalPlayer player = client.player;
         int menuSlot = toMenuSlotIndex(inventoryIndex);
@@ -688,6 +718,12 @@ public class GrinderBotClient implements ClientModInitializer {
         client.gameMode.useItem(player, InteractionHand.MAIN_HAND);
     }
 
+    private void restoreHeldSlot(Minecraft client) {
+        LocalPlayer player = client.player;
+        player.getInventory().setSelectedSlot(preGappleHotbarSlot);
+        player.connection.send(new ServerboundSetCarriedItemPacket(preGappleHotbarSlot));
+    }
+
     private void triggerRespawn(Minecraft client) {
         client.player.connection.send(
                 new ServerboundClientCommandPacket(ServerboundClientCommandPacket.Action.PERFORM_RESPAWN));
@@ -702,43 +738,82 @@ public class GrinderBotClient implements ClientModInitializer {
     private boolean hasSwordInHotbar(LocalPlayer player) {
         for (int i = 0; i < 9; i++) {
             ItemStack stack = player.getInventory().getItem(i);
-            if (!stack.isEmpty() && stack.has(DataComponents.WEAPON)) {
+            if (!stack.isEmpty() && (stack.is(ItemTags.SWORDS) || stack.is(ItemTags.AXES))) {
                 return true;
             }
         }
         return false;
     }
 
-    private ArmorStand findNearestArmorStand(Minecraft client) {
-        LocalPlayer player = client.player;
-        AABB box = player.getBoundingBox().inflate(ARMOR_STAND_SEARCH_RADIUS);
-        var candidates = client.level.getEntitiesOfClass(ArmorStand.class, box);
-
-        ArmorStand nearest = null;
-        double nearestDistSq = Double.MAX_VALUE;
-        for (ArmorStand stand : candidates) {
-            double distSq = stand.distanceToSqr(player);
-            if (distSq < nearestDistSq) {
-                nearestDistSq = distSq;
-                nearest = stand;
-            }
+    /** Searches the player's own inventory slots for the first item whose
+     *  display name contains {@code KIT_VOUCHER_NAME}. Returns raw inventory index (0-35), or -1. */
+    private int findVoucherInInventory(LocalPlayer player) {
+        var inventory = player.getInventory();
+        for (int i = 0; i < 36; i++) {
+            ItemStack stack = inventory.getItem(i);
+            if (!stack.isEmpty() && stack.getHoverName() != null
+                    && stack.getHoverName().getString().contains(KIT_VOUCHER_NAME)) {
+                return i;
+                    }
         }
-        return nearest;
+        return -1;
     }
 
-    private void buildKitClickQueue(Minecraft client) {
+    /** Swaps (press-number-key style) the item at the given raw inventory index
+     *  into the given hotbar slot (0-8), using the always-valid player inventory menu. */
+    private void swapItemIntoHotbar(Minecraft client, int inventoryIndex, int hotbarSlot) {
+        LocalPlayer player = client.player;
+        int menuSlot = toMenuSlotIndex(inventoryIndex);
+        client.gameMode.handleInventoryMouseClick(
+                player.inventoryMenu.containerId, menuSlot, hotbarSlot, ClickType.SWAP, player);
+    }
+
+    /** Extracts exactly ONE voucher from the vault's own slots into the player's
+     *  inventory, using the classic pickup/split/return-remainder 3-click trick. */
+    private void buildSingleVoucherExtractQueue(Minecraft client) {
         pendingActions.clear();
         if (!(client.screen instanceof AbstractContainerScreen<?> screen)) return;
         AbstractContainerMenu menu = screen.getMenu();
         LocalPlayer player = client.player;
 
+        Integer sourceIndex = null;
+        Integer emptyTargetIndex = null;
+
         for (var slot : menu.slots) {
-            if (slot.container != player.getInventory() && !slot.getItem().isEmpty()) {
-                int slotIndex = slot.index;
-                pendingActions.add(() -> Minecraft.getInstance().gameMode.handleInventoryMouseClick(
-                            menu.containerId, slotIndex, 0, ClickType.QUICK_MOVE, player));
+            boolean isPlayerSlot = slot.container == player.getInventory();
+            ItemStack stack = slot.getItem();
+
+            if (!isPlayerSlot && sourceIndex == null && !stack.isEmpty()
+                    && stack.getHoverName() != null
+                    && stack.getHoverName().getString().contains(KIT_VOUCHER_NAME)) {
+                sourceIndex = slot.index;
+                    }
+            if (isPlayerSlot && emptyTargetIndex == null && stack.isEmpty()) {
+                emptyTargetIndex = slot.index;
             }
         }
+
+        if (sourceIndex == null) {
+            notify("§cCouldn't find voucher stack in vault");
+            return;
+        }
+        if (emptyTargetIndex == null) {
+            notify("§cNo empty inventory slot to split voucher into");
+            return;
+        }
+
+        final int src = sourceIndex;
+        final int dst = emptyTargetIndex;
+
+        // 1. Left-click source: whole stack jumps onto cursor
+        pendingActions.add(() -> Minecraft.getInstance().gameMode.handleInventoryMouseClick(
+                    menu.containerId, src, 0, ClickType.PICKUP, player));
+        // 2. Right-click an empty slot: exactly 1 item drops there, remainder stays on cursor
+        pendingActions.add(() -> Minecraft.getInstance().gameMode.handleInventoryMouseClick(
+                    menu.containerId, dst, 1, ClickType.PICKUP, player));
+        // 3. Left-click source again (now empty): remainder from cursor goes back
+        pendingActions.add(() -> Minecraft.getInstance().gameMode.handleInventoryMouseClick(
+                    menu.containerId, src, 0, ClickType.PICKUP, player));
     }
 
     private void buildEquipQueue(Minecraft client) {
@@ -751,7 +826,8 @@ public class GrinderBotClient implements ClientModInitializer {
         queueArmorMove(menu, player, EquipmentSlot.LEGS, 7);
         queueArmorMove(menu, player, EquipmentSlot.FEET, 8);
 
-        queueItemToHotbarSlot(menu, player, stack -> stack.has(DataComponents.WEAPON), 36);
+        queueItemToHotbarSlot(menu, player,
+                stack -> stack.is(ItemTags.SWORDS) || stack.is(ItemTags.AXES), 36);
         queueItemToHotbarSlot(menu, player, stack -> stack.getItem() == Items.ENCHANTED_GOLDEN_APPLE, 44);
     }
 
